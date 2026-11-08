@@ -31,14 +31,49 @@ const MODEL_TRANSLATE_FILE: &str = "model_translate";
 /// Absent/invalid/0 = default (all cores).
 const MODEL_THREADS_FILE: &str = "model_threads";
 
-/// Longest audio passed to the model in one run (60 s). Offline conformer
-/// models use full self-attention, whose cost grows quadratically with input
-/// length — an unbounded shared audio file would exhaust memory on a phone.
-/// Longer input is split at quiet points and the texts joined.
-const MAX_RUN_SAMPLES: usize = 60 * 16_000;
+/// Per-language Whisper models, placed in the app's shared media directory
+/// (`Android/media/<package>/models/`) rather than bundled or imported. When
+/// the language setting names one of these languages, its model is loaded in
+/// place of the imported/bundled one. English and German share stock
+/// large-v3-turbo; Slovak and Hebrew use fine-tunes, which measured clearly
+/// better than stock (FLEURS: sk 6.4% vs 10.1% WER, he 18.4% vs 29.5%).
+const LANGUAGE_MODELS: &[(&str, &str)] = &[
+    ("en", "whisper-large-v3-turbo-q8_0.bin"),
+    ("de", "whisper-large-v3-turbo-q8_0.bin"),
+    ("sk", "whisper-large-v3-turbo-sk-q8_0.bin"),
+    ("he", "whisper-large-v3-turbo-he-q8_0.bin"),
+];
+
+/// Language ID model, in the same directory as the per-language models. With
+/// it present and the language setting on automatic, each run is classified
+/// among the [`LANGUAGE_MODELS`] languages and sent to that language's model.
+/// On whole dictation chunks it picked the right one of the four languages
+/// for 98-100% of FLEURS clips and for all 29 chunks of the test dictation.
+const LANGID_MODEL: &str = "lang-id-voxlingua107-ecapa-Q8_0.gguf";
+/// Below this probability (over the four languages) a run keeps the previous
+/// run's language rather than trusting a guess.
+const LANGID_MIN_P: f32 = 0.5;
+/// Language assumed until a run has been identified confidently.
+const LANGID_DEFAULT: &str = "en";
+
+/// The language-model file for a language tag (`de-DE` matches `de`), if any.
+fn language_model_file(language: Option<&str>) -> Option<&'static str> {
+    let primary = language?.split('-').next()?.to_ascii_lowercase();
+    LANGUAGE_MODELS
+        .iter()
+        .find(|(lang, _)| *lang == primary)
+        .map(|(_, file)| *file)
+}
+
+/// Longest audio passed to the model in one run (15 s). Whisper decodes a
+/// 30 s window either way, but on continuous dictation, independent runs of
+/// at most 15 s cut at quiet points were clearly more accurate than whole
+/// recordings, where the decoder drifted or looped. Longer input is split at
+/// quiet points and the texts joined.
+const MAX_RUN_SAMPLES: usize = 15 * 16_000;
 /// When splitting, search this far back from the hard boundary for the
 /// quietest point so words aren't cut mid-syllable.
-const SPLIT_SEARCH_SAMPLES: usize = 10 * 16_000;
+const SPLIT_SEARCH_SAMPLES: usize = 7 * 16_000;
 
 /// Length of the next piece of `samples` to transcribe in one model run:
 /// everything if it fits, otherwise up to the quietest point near the limit.
@@ -59,10 +94,25 @@ pub fn exceeds_one_run(samples: &[f32]) -> bool {
     samples.len() > MAX_RUN_SAMPLES
 }
 
+/// Per-run language routing (language setting on automatic).
+struct AutoLanguage {
+    langid: transcribe_cpp::LangIdSession,
+    /// Where the per-language models live.
+    models_dir: PathBuf,
+    /// The most recently used model other than the current one, kept loaded
+    /// so alternating between two languages doesn't reload each time.
+    spare: Option<(PathBuf, transcribe_cpp::Session)>,
+    threads: i32,
+    /// Language of the last run, used when identification is unsure.
+    last: String,
+}
+
 /// A loaded transcribe.cpp session plus the options applied to every run.
 pub struct Engine {
     session: transcribe_cpp::Session,
+    session_path: PathBuf,
     language: Option<String>,
+    auto: Option<AutoLanguage>,
     task: transcribe_cpp::Task,
     /// Family-specific decode options attached to every run; `None` for
     /// models that don't take the whisper run extension.
@@ -79,10 +129,7 @@ impl Engine {
         translate: bool,
         threads: i32,
     ) -> Result<Engine, String> {
-        if !model_path.is_file() {
-            return Err(format!("model file not found: {}", model_path.display()));
-        }
-        let model = transcribe_cpp::Model::load(model_path).map_err(|e| e.to_string())?;
+        let model = load_model(model_path)?;
         // Translation is gated on the model's capabilities: models without it
         // (e.g. Parakeet) silently keep transcribing, so the setting can stay
         // on while switching models.
@@ -120,9 +167,12 @@ impl Engine {
             transcribe_cpp::ExtSlot::Run,
             transcribe_cpp::sys::TRANSCRIBE_EXT_KIND_WHISPER_RUN,
         ) {
+            // Each run also starts without the previous run's text as a
+            // prompt: carried-over context made the Slovak fine-tune loop.
             Some(transcribe_cpp::RunExtension::Whisper(
                 transcribe_cpp::WhisperRunOptions {
                     temperature_inc: Some(0.0),
+                    condition_on_prev_tokens: Some(false),
                     ..Default::default()
                 },
             ))
@@ -136,32 +186,55 @@ impl Engine {
             task,
             run_ext.is_some()
         );
-        let options = transcribe_cpp::SessionOptions {
-            n_threads: threads,
-            ..Default::default()
-        };
-        let session = model.session_with(&options).map_err(|e| e.to_string())?;
+        let session = open_session(&model, threads)?;
         Ok(Engine {
             session,
+            session_path: model_path.to_path_buf(),
             language,
+            auto: None,
             task,
             run_ext,
             ready_status,
         })
     }
 
+    /// Loads the engine for automatic language routing: starts on the model
+    /// for [`LANGID_DEFAULT`] and loads the others on demand.
+    fn load_auto(models_dir: &Path, translate: bool, threads: i32) -> Result<Engine, String> {
+        let langid_model = load_model(&models_dir.join(LANGID_MODEL))?;
+        let langid = langid_model
+            .langid_session_with(&transcribe_cpp::LangIdSessionOptions { n_threads: threads })
+            .map_err(|e| e.to_string())?;
+        let first = language_model_file(Some(LANGID_DEFAULT)).expect("default language has a model");
+        let mut engine = Engine::load(
+            &models_dir.join(first),
+            Some(LANGID_DEFAULT.to_string()),
+            translate,
+            threads,
+        )?;
+        engine.auto = Some(AutoLanguage {
+            langid,
+            models_dir: models_dir.to_path_buf(),
+            spare: None,
+            threads,
+            last: LANGID_DEFAULT.to_string(),
+        });
+        log::info!("engine: automatic language routing");
+        Ok(engine)
+    }
+
     /// Transcribes 16 kHz mono f32 samples to text. Input longer than
     /// [`MAX_RUN_SAMPLES`] is transcribed in quiet-point chunks.
     pub fn transcribe(&mut self, samples: Vec<f32>) -> Result<String, String> {
         if samples.len() <= MAX_RUN_SAMPLES {
-            return self.run(&samples);
+            return self.route_and_run(&samples);
         }
 
         let mut text = String::new();
         let mut rest: &[f32] = &samples;
         while !rest.is_empty() {
             let take = next_run_len(rest);
-            let piece = self.run(&rest[..take])?;
+            let piece = self.route_and_run(&rest[..take])?;
             let piece = piece.trim();
             if !piece.is_empty() {
                 if !text.is_empty() {
@@ -172,6 +245,68 @@ impl Engine {
             rest = &rest[take..];
         }
         Ok(text)
+    }
+
+    /// One run; with automatic routing, first identifies the run's language
+    /// and switches to its model.
+    fn route_and_run(&mut self, samples: &[f32]) -> Result<String, String> {
+        if self.auto.is_some() {
+            let lang = self.identify(samples);
+            self.switch_to(&lang)?;
+        }
+        self.run(samples)
+    }
+
+    /// The run's language among [`LANGUAGE_MODELS`], or the previous run's
+    /// when identification fails (e.g. under 0.5 s of audio) or is unsure.
+    fn identify(&mut self, samples: &[f32]) -> String {
+        let auto = self.auto.as_mut().expect("automatic routing");
+        let allowed = LANGUAGE_MODELS.iter().map(|(lang, _)| lang.to_string()).collect();
+        let options = transcribe_cpp::LangIdOptions { allowed: Some(allowed) };
+        match auto.langid.run(samples, &options) {
+            Ok(result) => {
+                let top = result.candidates.first();
+                // VoxLingua107 labels Hebrew with the old code `iw`.
+                let code = top.map(|c| if c.code == "iw" { "he" } else { c.code.as_str() });
+                let p = top.map(|c| c.p).unwrap_or(0.0);
+                match code {
+                    Some(code) if p >= LANGID_MIN_P => {
+                        log::info!("language: {} (p={:.2})", code, p);
+                        auto.last = code.to_string();
+                    }
+                    _ => log::info!("language unsure ({:?}, p={:.2}); keeping {}", code, p, auto.last),
+                }
+            }
+            Err(e) => log::info!("language ID failed ({}); keeping {}", e, auto.last),
+        }
+        auto.last.clone()
+    }
+
+    /// Makes the current session the one for `lang`'s model, swapping in the
+    /// spare or loading it (the current one then becomes the spare).
+    fn switch_to(&mut self, lang: &str) -> Result<(), String> {
+        self.language = Some(lang.to_string());
+        let auto = self.auto.as_mut().expect("automatic routing");
+        let file = language_model_file(Some(lang)).ok_or_else(|| format!("no model for {}", lang))?;
+        let path = auto.models_dir.join(file);
+        if path == self.session_path {
+            return Ok(());
+        }
+        let (path, session) = match auto.spare.take() {
+            Some((spare_path, spare)) if spare_path == path => (spare_path, spare),
+            other => {
+                // Free the old spare first: it is the least recently used.
+                drop(other);
+                let started = std::time::Instant::now();
+                let session = open_session(&load_model(&path)?, auto.threads)?;
+                log::info!("loaded {} in {:.2}s", file, started.elapsed().as_secs_f64());
+                (path, session)
+            }
+        };
+        let previous_path = std::mem::replace(&mut self.session_path, path);
+        let previous = std::mem::replace(&mut self.session, session);
+        auto.spare = Some((previous_path, previous));
+        Ok(())
     }
 
     /// One model run. A rejected language hint is degraded instead of
@@ -213,22 +348,53 @@ impl Engine {
     }
 }
 
+/// Loads a model file.
+fn load_model(path: &Path) -> Result<transcribe_cpp::Model, String> {
+    if !path.is_file() {
+        return Err(format!("model file not found: {}", path.display()));
+    }
+    transcribe_cpp::Model::load(path).map_err(|e| e.to_string())
+}
+
+/// Opens a transcription session on a loaded model.
+fn open_session(model: &transcribe_cpp::Model, threads: i32) -> Result<transcribe_cpp::Session, String> {
+    let options = transcribe_cpp::SessionOptions {
+        n_threads: threads,
+        ..Default::default()
+    };
+    model.session_with(&options).map_err(|e| e.to_string())
+}
+
 /// Holds the loaded engine singleton.
 static GLOBAL_ENGINE: Lazy<Mutex<Option<Arc<Mutex<Engine>>>>> =
     Lazy::new(|| Mutex::new(None));
+
+/// Where the engine's settings and per-language models live.
+#[derive(Debug, Clone)]
+struct ConfigDirs {
+    files_dir: PathBuf,
+    media_dir: Option<PathBuf>,
+}
 
 /// The settings the loaded engine was built from, and where they live.
 /// Comparing against the files on disk before transcribing makes any user of
 /// the engine pick up a changed model or language, whichever screen changed
 /// it, instead of keeping the old one until the process dies.
-static LOADED_CONFIG: Lazy<Mutex<Option<(PathBuf, EngineConfig)>>> =
+static LOADED_CONFIG: Lazy<Mutex<Option<(ConfigDirs, EngineConfig)>>> =
     Lazy::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, PartialEq)]
 struct EngineConfig {
+    /// The per-language model for the language setting, if it has one;
+    /// takes precedence over `active_model`.
+    language_model: Option<PathBuf>,
+    /// The per-language models' directory when the language setting is
+    /// automatic and the language ID model is present there; takes
+    /// precedence over `active_model`.
+    auto_models_dir: Option<PathBuf>,
     active_model: Option<String>,
-    /// Size and mtime of the imported model file, so re-importing a file
-    /// under the same name also reloads.
+    /// Size and mtime of the model file to load, so replacing a file under
+    /// the same name also reloads.
     model_stamp: Option<(u64, Option<SystemTime>)>,
     language: Option<String>,
     translate: bool,
@@ -236,19 +402,33 @@ struct EngineConfig {
 }
 
 impl EngineConfig {
-    fn read(files_dir: &Path) -> EngineConfig {
+    fn read(files_dir: &Path, media_dir: Option<&Path>) -> EngineConfig {
+        // Absent/empty or "auto" = no hint (the model's automatic mode).
+        // A tag the model doesn't know is degraded per run (Engine::run).
+        let language = read_config(&files_dir.join(MODEL_LANGUAGE_FILE))
+            .filter(|l| !l.eq_ignore_ascii_case("auto"));
+        let models_dir = media_dir.map(|dir| dir.join("models"));
+        let language_model = models_dir
+            .as_ref()
+            .zip(language_model_file(language.as_deref()))
+            .map(|(dir, file)| dir.join(file));
+        let auto_models_dir = models_dir
+            .filter(|dir| language.is_none() && dir.join(LANGID_MODEL).is_file());
         let active_model = read_config(&files_dir.join(ACTIVE_MODEL_FILE));
-        let model_stamp = active_model.as_ref().and_then(|name| {
-            let meta = std::fs::metadata(files_dir.join("models").join(name)).ok()?;
+        let model_path = language_model
+            .clone()
+            .or_else(|| auto_models_dir.as_ref().map(|dir| dir.join(LANGID_MODEL)))
+            .or_else(|| active_model.as_ref().map(|name| files_dir.join("models").join(name)));
+        let model_stamp = model_path.and_then(|path| {
+            let meta = std::fs::metadata(path).ok()?;
             Some((meta.len(), meta.modified().ok()))
         });
         EngineConfig {
+            language_model,
+            auto_models_dir,
             active_model,
             model_stamp,
-            // Absent/empty or "auto" = no hint (the model's automatic mode).
-            // A tag the model doesn't know is degraded per run (Engine::run).
-            language: read_config(&files_dir.join(MODEL_LANGUAGE_FILE))
-                .filter(|l| !l.eq_ignore_ascii_case("auto")),
+            language,
             translate: files_dir.join(MODEL_TRANSLATE_FILE).exists(),
             threads: read_config(&files_dir.join(MODEL_THREADS_FILE))
                 .and_then(|s| s.parse::<i32>().ok())
@@ -260,7 +440,9 @@ impl EngineConfig {
 /// True if the model settings changed since the engine was loaded.
 fn config_is_stale() -> bool {
     match &*LOADED_CONFIG.lock().unwrap() {
-        Some((dir, loaded)) => EngineConfig::read(dir) != *loaded,
+        Some((dirs, loaded)) => {
+            EngineConfig::read(&dirs.files_dir, dirs.media_dir.as_deref()) != *loaded
+        }
         None => false,
     }
 }
@@ -622,11 +804,62 @@ fn do_load(env: &mut JNIEnv, context: &JObject) -> Result<(), String> {
         notify_status(env, context, &format!("Error: {}", msg));
         msg
     })?;
-    let config = EngineConfig::read(&files_dir);
+    // No shared storage just means no per-language models.
+    let media_dir = assets::media_dir(env, context)
+        .map_err(|e| log::warn!("no media dir: {}", e))
+        .ok();
+    let dirs = ConfigDirs {
+        files_dir: files_dir.clone(),
+        media_dir,
+    };
+    let config = EngineConfig::read(&dirs.files_dir, dirs.media_dir.as_deref());
     let language = config.language.clone();
     let translate = config.translate;
     let threads = config.threads.unwrap_or_else(performance_core_count);
     let has_builtin = assets::has_builtin_model(env, context);
+
+    // The language's own model, if it has one. A missing file is an error
+    // rather than a silent fallback to a model that is worse at the language.
+    if let Some(path) = config.language_model.clone() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        notify_status(env, context, &format!("Loading model {}...", name));
+        return match Engine::load(&path, language, translate, threads) {
+            Ok(engine) => {
+                let status = engine.ready_status;
+                *GLOBAL_ENGINE.lock().unwrap() = Some(Arc::new(Mutex::new(engine)));
+                *LOADED_CONFIG.lock().unwrap() = Some((dirs, config));
+                notify_status(env, context, status);
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("Language model {} failed to load: {}", path.display(), e);
+                let msg = format!("Error loading {}: {}", name, e);
+                notify_status(env, context, &msg);
+                Err(msg)
+            }
+        };
+    }
+
+    // Automatic language: route each run to its language's model. Like a
+    // fixed language's model, a load failure is an error, not a fallback.
+    if let Some(dir) = config.auto_models_dir.clone() {
+        notify_status(env, context, "Loading models...");
+        return match Engine::load_auto(&dir, translate, threads) {
+            Ok(engine) => {
+                let status = engine.ready_status;
+                *GLOBAL_ENGINE.lock().unwrap() = Some(Arc::new(Mutex::new(engine)));
+                *LOADED_CONFIG.lock().unwrap() = Some((dirs, config));
+                notify_status(env, context, status);
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("Automatic language setup in {} failed: {}", dir.display(), e);
+                let msg = format!("Error loading models: {}", e);
+                notify_status(env, context, &msg);
+                Err(msg)
+            }
+        };
+    }
 
     if let Some(name) = config.active_model.clone() {
         let path = files_dir.join("models").join(&name);
@@ -635,7 +868,7 @@ fn do_load(env: &mut JNIEnv, context: &JObject) -> Result<(), String> {
             Ok(engine) => {
                 let status = engine.ready_status;
                 *GLOBAL_ENGINE.lock().unwrap() = Some(Arc::new(Mutex::new(engine)));
-                *LOADED_CONFIG.lock().unwrap() = Some((files_dir, config));
+                *LOADED_CONFIG.lock().unwrap() = Some((dirs, config));
                 notify_status(env, context, status);
                 return Ok(());
             }
@@ -675,7 +908,7 @@ fn do_load(env: &mut JNIEnv, context: &JObject) -> Result<(), String> {
         Ok(engine) => {
             let status = engine.ready_status;
             *GLOBAL_ENGINE.lock().unwrap() = Some(Arc::new(Mutex::new(engine)));
-            *LOADED_CONFIG.lock().unwrap() = Some((files_dir, config));
+            *LOADED_CONFIG.lock().unwrap() = Some((dirs, config));
             notify_status(env, context, status);
             Ok(())
         }

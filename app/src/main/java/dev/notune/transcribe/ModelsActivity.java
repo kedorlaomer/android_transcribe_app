@@ -159,7 +159,7 @@ public class ModelsActivity extends AppCompatActivity {
             "et-EE", "fi-FI", "fr-FR", "de-DE", "el-GR", "hu-HU", "it-IT",
             "lv-LV", "lt-LT", "mt-MT", "pl-PL", "pt-PT", "pt-BR", "ro-RO",
             "ru-RU", "sk-SK", "sl-SI", "es-ES", "sv-SE", "uk-UA",
-            "ar-SA", "zh-CN", "hi-IN", "ja-JP", "ko-KR", "tr-TR",
+            "ar-SA", "zh-CN", "hi-IN", "ja-JP", "ko-KR", "tr-TR", "he-IL",
     };
 
     private void setupLanguageSpinner() {
@@ -274,9 +274,18 @@ public class ModelsActivity extends AppCompatActivity {
         String active = ModelStore.ensureValidSelection(this);
         List<String> names = ModelStore.importedModels(this);
         boolean builtin = ModelStore.hasBuiltinModel(this);
+        List<String> languageModels = ModelStore.languageModels(this);
 
         findViewById(R.id.no_model_area).setVisibility(
-                builtin || !names.isEmpty() ? View.GONE : View.VISIBLE);
+                builtin || !names.isEmpty() || !languageModels.isEmpty()
+                        ? View.GONE : View.VISIBLE);
+
+        // The per-language models are used according to the language setting,
+        // not by selection, so they are listed without a radio button.
+        for (String name : languageModels) {
+            File f = new File(ModelStore.languageModelsDir(this), name);
+            addLanguageModelRow(name, Formatter.formatShortFileSize(this, f.length()));
+        }
 
         if (builtin) {
             addModelRow(getString(R.string.models_builtin),
@@ -287,6 +296,17 @@ public class ModelsActivity extends AppCompatActivity {
                     this, new File(ModelStore.modelsDir(this), name).length());
             addModelRow(name, size, name, name.equals(active));
         }
+    }
+
+    /** Adds a row for a per-language model: shown, but not selectable or deletable. */
+    private void addLanguageModelRow(String title, String size) {
+        View row = getLayoutInflater().inflate(R.layout.item_model, modelList, false);
+        ((TextView) row.findViewById(R.id.txt_model_name)).setText(title);
+        ((TextView) row.findViewById(R.id.txt_model_sub)).setText(
+                getString(R.string.models_language_model_sub, size));
+        row.findViewById(R.id.radio_model).setVisibility(View.GONE);
+        row.findViewById(R.id.btn_model_delete).setVisibility(View.GONE);
+        modelList.addView(row);
     }
 
     /** Adds one selectable row; {@code fileName} is null for the built-in model. */
@@ -385,7 +405,7 @@ public class ModelsActivity extends AppCompatActivity {
         String name = queryDisplayName(uri);
         long size = querySize(uri);
 
-        if (name == null || !ModelStore.isGguf(name)) {
+        if (name == null || !ModelStore.isModelFile(name)) {
             new MaterialAlertDialogBuilder(this)
                     .setTitle(R.string.models_import_bad_title)
                     .setMessage(R.string.models_import_bad_body)

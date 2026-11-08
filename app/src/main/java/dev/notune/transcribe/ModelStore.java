@@ -56,7 +56,25 @@ public final class ModelStore {
     }
 
     public static boolean hasAnyModel(Context ctx) {
-        return hasBuiltinModel(ctx) || !importedModels(ctx).isEmpty();
+        return hasBuiltinModel(ctx) || !importedModels(ctx).isEmpty()
+                || hasLanguageModels(ctx);
+    }
+
+    /**
+     * Directory for the per-language models ({@code Android/media/<package>/models/}),
+     * which are copied onto the device next to the APK instead of being
+     * bundled or imported. The native engine picks the file for the language
+     * setting; see {@code LANGUAGE_MODELS} in {@code src/engine.rs}.
+     */
+    public static File languageModelsDir(Context ctx) {
+        File[] media = ctx.getExternalMediaDirs();
+        if (media.length == 0 || media[0] == null) return null;
+        return new File(media[0], "models");
+    }
+
+    /** True if any per-language model file is present. */
+    public static boolean hasLanguageModels(Context ctx) {
+        return !languageModels(ctx).isEmpty();
     }
 
     public static File modelsDir(Context ctx) {
@@ -68,7 +86,7 @@ public final class ModelStore {
     /** File names of the imported models, sorted for display. */
     public static List<String> importedModels(Context ctx) {
         List<String> names = new ArrayList<>();
-        File[] files = modelsDir(ctx).listFiles((dir, name) -> isGguf(name));
+        File[] files = modelsDir(ctx).listFiles((dir, name) -> isModelFile(name));
         if (files != null) {
             for (File f : files) names.add(f.getName());
         }
@@ -78,6 +96,27 @@ public final class ModelStore {
 
     static boolean isGguf(String name) {
         return name.toLowerCase(Locale.ROOT).endsWith(".gguf");
+    }
+
+    /**
+     * True for files the engine can load: GGUF, or a legacy whisper.cpp
+     * {@code .bin}, which transcribe.cpp reads directly.
+     */
+    static boolean isModelFile(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".gguf") || lower.endsWith(".bin");
+    }
+
+    /** File names in the per-language models directory, sorted for display. */
+    public static List<String> languageModels(Context ctx) {
+        List<String> names = new ArrayList<>();
+        File dir = languageModelsDir(ctx);
+        File[] files = dir == null ? null : dir.listFiles((d, name) -> isModelFile(name));
+        if (files != null) {
+            for (File f : files) names.add(f.getName());
+        }
+        names.sort(String.CASE_INSENSITIVE_ORDER);
+        return names;
     }
 
     /** The selected imported model, or "" for the bundled one. */

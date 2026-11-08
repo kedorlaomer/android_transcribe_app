@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Distinguishes the development build from the released app on the launcher. -->
+    <string name="app_name">Voice Input (dev)</string>
+</resources>

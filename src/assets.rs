@@ -31,6 +31,25 @@ pub fn files_dir(env: &mut JNIEnv, context: &JObject) -> anyhow::Result<PathBuf>
     Ok(PathBuf::from(path_string))
 }
 
+/// Resolves the app's shared-storage media directory
+/// (`Android/media/<package>/`), where the per-language models are placed.
+pub fn media_dir(env: &mut JNIEnv, context: &JObject) -> anyhow::Result<PathBuf> {
+    use jni::objects::JObjectArray;
+    let dirs: JObjectArray = env
+        .call_method(context, "getExternalMediaDirs", "()[Ljava/io/File;", &[])?
+        .l()?
+        .into();
+    let first = env.get_object_array_element(&dirs, 0)?;
+    if first.is_null() {
+        anyhow::bail!("shared storage unavailable");
+    }
+    let path_str_obj = env
+        .call_method(&first, "getAbsolutePath", "()Ljava/lang/String;", &[])?
+        .l()?;
+    let path_string: String = env.get_string(&path_str_obj.into())?.into();
+    Ok(PathBuf::from(path_string))
+}
+
 /// True if this build bundles a model (F-Droid builds don't). Judged on the
 /// APK assets rather than an earlier extraction, so it matches the app's
 /// `ModelStore.hasBuiltinModel`.

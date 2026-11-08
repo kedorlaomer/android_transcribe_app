@@ -51,6 +51,10 @@ android {
     }
 
     buildTypes {
+        // Debug builds install alongside the released app instead of replacing it.
+        debug {
+            applicationIdSuffix = ".dev"
+        }
         release {
             // R8 drops the unused parts of Material/AppCompat. Native code
             // calls back into Java by name; proguard-rules.pro keeps those.
@@ -162,13 +166,15 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     doLast {
         val ndkPath = environment["ANDROID_NDK_HOME"] as String
         val triples = mapOf("arm64-v8a" to "aarch64-linux-android", "x86_64" to "x86_64-linux-android")
-        val llvmStrip = file("$ndkPath/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip")
+        // The NDK names its prebuilt toolchain after the build host.
+        val hostTag = if (System.getProperty("os.name").startsWith("Mac")) "darwin-x86_64" else "linux-x86_64"
+        val llvmStrip = file("$ndkPath/toolchains/llvm/prebuilt/$hostTag/bin/llvm-strip")
         if (!llvmStrip.exists()) {
             throw GradleException("llvm-strip not found in NDK at: ${llvmStrip.absolutePath}")
         }
         targetAbis.forEach { abi ->
             val triple = triples[abi] ?: throw GradleException("Unsupported ABI: $abi")
-            val libcpp = file("$ndkPath/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/libc++_shared.so")
+            val libcpp = file("$ndkPath/toolchains/llvm/prebuilt/$hostTag/sysroot/usr/lib/$triple/libc++_shared.so")
             if (!libcpp.exists()) {
                 throw GradleException("libc++_shared.so not found in NDK at: ${libcpp.absolutePath}")
             }
