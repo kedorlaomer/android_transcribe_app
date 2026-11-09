@@ -201,7 +201,9 @@ impl Engine {
     /// Loads the engine for automatic language routing: starts on the model
     /// for [`LANGID_DEFAULT`] and loads the others on demand.
     fn load_auto(models_dir: &Path, translate: bool, threads: i32) -> Result<Engine, String> {
-        let langid_model = load_model(&models_dir.join(LANGID_MODEL))?;
+        // Language ID is small and runs once per run; on the CPU it is faster
+        // than on the GPU and doesn't compete with the encoder for it.
+        let langid_model = load_model_with(&models_dir.join(LANGID_MODEL), transcribe_cpp::Backend::Cpu)?;
         let langid = langid_model
             .langid_session_with(&transcribe_cpp::LangIdSessionOptions { n_threads: threads })
             .map_err(|e| e.to_string())?;
@@ -360,10 +362,34 @@ impl Engine {
 
 /// Loads a model file.
 fn load_model(path: &Path) -> Result<transcribe_cpp::Model, String> {
+    load_model_with(path, transcribe_cpp::Backend::Auto)
+}
+
+/// Loads a model on `backend` (Auto: the GPU where this build has one).
+fn load_model_with(path: &Path, backend: transcribe_cpp::Backend) -> Result<transcribe_cpp::Model, String> {
     if !path.is_file() {
         return Err(format!("model file not found: {}", path.display()));
     }
-    transcribe_cpp::Model::load(path).map_err(|e| e.to_string())
+    let options = transcribe_cpp::ModelOptions { backend, device: None };
+    let model = transcribe_cpp::Model::load_with(path, &options).map_err(|e| e.to_string())?;
+    log::info!("loaded {} on {}", path.display(), model.backend());
+    Ok(model)
+}
+
+/// Environment for GPU builds, set before the first model load: the
+/// encoder runs on the GPU and the decoder on the CPU (one decode step at a
+/// time is slow on the GPU), and compiled GPU kernels are cached in the
+/// app's cache dir (there is no TMPDIR in an app process; without a cache
+/// every start recompiles them, which takes tens of seconds).
+fn configure_gpu_env(files_dir: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("TRANSCRIBE_WHISPER_CPU_DECODER", "1");
+        if let Some(cache) = files_dir.parent().map(|app| app.join("cache").join("cl-cache")) {
+            let _ = std::fs::create_dir_all(&cache);
+            std::env::set_var("GGML_OPENCL_KERNEL_CACHE_DIR", cache);
+        }
+    });
 }
 
 /// Opens a transcription session on a loaded model.
@@ -818,6 +844,7 @@ fn do_load(env: &mut JNIEnv, context: &JObject) -> Result<(), String> {
     let media_dir = assets::media_dir(env, context)
         .map_err(|e| log::warn!("no media dir: {}", e))
         .ok();
+    configure_gpu_env(&files_dir);
     let dirs = ConfigDirs {
         files_dir: files_dir.clone(),
         media_dir,

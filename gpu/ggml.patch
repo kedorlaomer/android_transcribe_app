@@ -1,0 +1,277 @@
+diff -ruN a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+--- a/ggml/include/ggml-backend.h	2026-11-09 21:19:44.240094267 +0200
++++ b/ggml/include/ggml-backend.h	2026-11-08 22:00:49.000000000 +0200
+@@ -276,6 +276,13 @@
+     GGML_API void               ggml_backend_load_all(void);
+     GGML_API void               ggml_backend_load_all_from_path(const char * dir_path);
+ 
++    // Registration filter (transcribe.cpp patch): consulted with the module
++    // name ("cpu", "vulkan", "hip", ...; "external" for GGML_BACKEND_PATH)
++    // before registering a compiled-in backend or opening a module. Install
++    // before first registry access. ggml_backend_load(path) is not filtered.
++    typedef bool (*ggml_backend_reg_filter_t)(const char * name);
++    GGML_API void               ggml_backend_set_reg_filter(ggml_backend_reg_filter_t filter);
++
+     //
+     // Backend scheduler
+     //
+diff -ruN a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
+--- a/ggml/src/ggml-backend-reg.cpp	2026-11-09 21:19:44.722545780 +0200
++++ b/ggml/src/ggml-backend-reg.cpp	2026-11-08 22:00:49.000000000 +0200
+@@ -3,6 +3,7 @@
+ #include "ggml-backend-dl.h"
+ #include "ggml-impl.h"
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <filesystem>
+ #include <memory>
+@@ -107,6 +108,17 @@
+     }
+ }
+ 
++static std::atomic<ggml_backend_reg_filter_t> g_reg_filter{nullptr};
++
++static bool reg_allowed(const char * name) {
++    ggml_backend_reg_filter_t filter = g_reg_filter.load();
++    return filter == nullptr || filter(name);
++}
++
++void ggml_backend_set_reg_filter(ggml_backend_reg_filter_t filter) {
++    g_reg_filter.store(filter);
++}
++
+ struct ggml_backend_reg_entry {
+     ggml_backend_reg_t reg;
+     dl_handle_ptr handle;
+@@ -118,58 +130,95 @@
+ 
+     ggml_backend_registry() {
+ #ifdef GGML_USE_CUDA
+-        register_backend(ggml_backend_cuda_reg());
++        // HIP/MUSA reuse the CUDA backend; filter under their module name.
++#if defined(GGML_USE_HIP)
++        if (reg_allowed("hip")) {
++#elif defined(GGML_USE_MUSA)
++        if (reg_allowed("musa")) {
++#else
++        if (reg_allowed("cuda")) {
++#endif
++            register_backend(ggml_backend_cuda_reg());
++        }
+ #endif
+ #ifdef GGML_USE_METAL
+-        register_backend(ggml_backend_metal_reg());
++        if (reg_allowed("metal")) {
++            register_backend(ggml_backend_metal_reg());
++        }
+ #endif
+ #ifdef GGML_USE_SYCL
+-        register_backend(ggml_backend_sycl_reg());
++        if (reg_allowed("sycl")) {
++            register_backend(ggml_backend_sycl_reg());
++        }
+ #endif
+ #ifdef GGML_USE_VULKAN
+     // Add runtime disable check
+-    if (getenv("GGML_DISABLE_VULKAN") == nullptr) {
+-        register_backend(ggml_backend_vk_reg());
+-    } else {
++    if (getenv("GGML_DISABLE_VULKAN") != nullptr) {
+         GGML_LOG_DEBUG("Vulkan backend disabled by GGML_DISABLE_VULKAN environment variable\n");
++    } else if (reg_allowed("vulkan")) {
++        register_backend(ggml_backend_vk_reg());
+     }
+ #endif
+ #ifdef GGML_USE_WEBGPU
+-        register_backend(ggml_backend_webgpu_reg());
++        if (reg_allowed("webgpu")) {
++            register_backend(ggml_backend_webgpu_reg());
++        }
+ #endif
+ #ifdef GGML_USE_ZDNN
+-        register_backend(ggml_backend_zdnn_reg());
++        if (reg_allowed("zdnn")) {
++            register_backend(ggml_backend_zdnn_reg());
++        }
+ #endif
+ #ifdef GGML_USE_VIRTGPU_FRONTEND
+-        register_backend(ggml_backend_virtgpu_reg());
++        if (reg_allowed("virtgpu")) {
++            register_backend(ggml_backend_virtgpu_reg());
++        }
+ #endif
+ 
+ #ifdef GGML_USE_OPENCL
+-        register_backend(ggml_backend_opencl_reg());
++        if (reg_allowed("opencl")) {
++            register_backend(ggml_backend_opencl_reg());
++        }
+ #endif
+ #ifdef GGML_USE_ZENDNN
+-        register_backend(ggml_backend_zendnn_reg());
++        if (reg_allowed("zendnn")) {
++            register_backend(ggml_backend_zendnn_reg());
++        }
+ #endif
+ #ifdef GGML_USE_HEXAGON
+-        register_backend(ggml_backend_hexagon_reg());
++        if (reg_allowed("hexagon")) {
++            register_backend(ggml_backend_hexagon_reg());
++        }
+ #endif
+ #ifdef GGML_USE_CANN
+-        register_backend(ggml_backend_cann_reg());
++        if (reg_allowed("cann")) {
++            register_backend(ggml_backend_cann_reg());
++        }
+ #endif
+ #ifdef GGML_USE_BLAS
+-        register_backend(ggml_backend_blas_reg());
++        if (reg_allowed("blas")) {
++            register_backend(ggml_backend_blas_reg());
++        }
+ #endif
+ #ifdef GGML_USE_RPC
+-        register_backend(ggml_backend_rpc_reg());
++        if (reg_allowed("rpc")) {
++            register_backend(ggml_backend_rpc_reg());
++        }
+ #endif
+ #ifdef GGML_USE_OPENVINO
+-        register_backend(ggml_backend_openvino_reg());
++        if (reg_allowed("openvino")) {
++            register_backend(ggml_backend_openvino_reg());
++        }
+ #endif
+ #ifdef GGML_USE_ET
+-        register_backend(ggml_backend_et_reg());
++        if (reg_allowed("et")) {
++            register_backend(ggml_backend_et_reg());
++        }
+ #endif
+ #ifdef GGML_USE_CPU
+-        register_backend(ggml_backend_cpu_reg());
++        if (reg_allowed("cpu")) {
++            register_backend(ggml_backend_cpu_reg());
++        }
+ #endif
+     }
+ 
+@@ -478,6 +527,10 @@
+ }
+ 
+ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent, const char * user_search_path) {
++    if (!reg_allowed(name)) {
++        return nullptr;
++    }
++
+     // enumerate all the files that match [lib]ggml-name-*.[so|dll] in the search paths
+     const fs::path name_path = fs::u8path(name);
+     const fs::path file_prefix = backend_filename_prefix().native() + name_path.native() + fs::u8path("-").native();
+@@ -592,7 +645,7 @@
+     ggml_backend_load_best("cpu", silent, dir_path);
+     // check the environment variable GGML_BACKEND_PATH to load an out-of-tree backend
+     const char * backend_path = std::getenv("GGML_BACKEND_PATH");
+-    if (backend_path) {
++    if (backend_path && reg_allowed("external")) {
+         ggml_backend_load(backend_path);
+     }
+ }
+diff -ruN a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c	2026-11-09 21:19:44.418758113 +0200
++++ b/ggml/src/ggml-cpu/ggml-cpu.c	2026-11-08 22:00:49.000000000 +0200
+@@ -534,6 +534,14 @@
+ static inline void ggml_thread_cpu_relax(void) {
+     _mm_pause();
+ }
++#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
++// MSVC defines _M_X64 / _M_IX86 (NOT __x86_64__), so without this branch the
++// spin-wait relax compiled to an empty no-op on MSVC — barrier waiters busy-spin
++// with no pause, starving an un-arrived worker under CPU oversubscription and
++// deadlocking ggml_barrier. YieldProcessor() emits `pause` on x86/x64.
++static inline void ggml_thread_cpu_relax(void) {
++    YieldProcessor();
++}
+ #elif defined(__riscv)
+ static inline void ggml_thread_cpu_relax(void) {
+     #ifdef __riscv_zihintpause
+@@ -547,6 +555,24 @@
+ static inline void ggml_thread_cpu_relax(void) {;}
+ #endif
+ 
++// Yield the current core to any other ready thread. A pure pause/relax spin does
++// NOT relinquish the core, so under CPU oversubscription (more compute threads
++// than available logical CPUs — e.g. a 2-vCPU runner) barrier waiters can starve
++// a not-yet-arrived worker indefinitely, deadlocking ggml_barrier. After a bounded
++// pause-spin the waiters fall back to a real yield so the missing worker can run.
++static inline void ggml_thread_yield(void) {
++#if defined(_WIN32)
++    SwitchToThread();
++#else
++    sched_yield();
++#endif
++}
++
++// Pause-spin iterations to burn before falling back to ggml_thread_yield(). Large
++// enough that a normally-fast barrier (all workers already arriving) never yields,
++// small enough to recover quickly when a worker is being starved.
++#define GGML_BARRIER_SPIN_BEFORE_YIELD 4096
++
+ //
+ // NUMA support
+ //
+@@ -606,8 +632,17 @@
+     }
+ 
+     // wait for other threads
++    int spin = 0;
+     while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+-        ggml_thread_cpu_relax();
++        if (++spin < GGML_BARRIER_SPIN_BEFORE_YIELD) {
++            ggml_thread_cpu_relax();
++        } else {
++            // Bounded pause-spin elapsed without release: yield so a worker that
++            // has not yet reached the barrier can be scheduled (prevents the
++            // oversubscription deadlock described at ggml_thread_yield).
++            ggml_thread_yield();
++            spin = 0;
++        }
+     }
+ 
+     // exit barrier (full seq-cst fence)
+diff -ruN a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+--- a/ggml/src/ggml-hip/CMakeLists.txt	2026-11-09 21:19:44.797785498 +0200
++++ b/ggml/src/ggml-hip/CMakeLists.txt	2026-11-08 22:00:49.000000000 +0200
+@@ -81,6 +81,8 @@
+ # TODO: do not use CUDA definitions for HIP
+ if (NOT GGML_BACKEND_DL)
+     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
++    # transcribe.cpp: reg filter name
++    target_compile_definitions(ggml PRIVATE GGML_USE_HIP)
+ endif()
+ 
+ add_compile_definitions(GGML_USE_HIP)
+diff -ruN a/ggml/src/ggml-musa/CMakeLists.txt b/ggml/src/ggml-musa/CMakeLists.txt
+--- a/ggml/src/ggml-musa/CMakeLists.txt	2026-11-09 21:19:44.721357279 +0200
++++ b/ggml/src/ggml-musa/CMakeLists.txt	2026-11-08 22:00:49.000000000 +0200
+@@ -66,6 +66,8 @@
+     # TODO: do not use CUDA definitions for MUSA
+     if (NOT GGML_BACKEND_DL)
+         target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
++        # transcribe.cpp: reg filter name
++        target_compile_definitions(ggml PRIVATE GGML_USE_MUSA)
+     endif()
+ 
+     add_compile_definitions(GGML_USE_MUSA)
+diff -ruN a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp	2026-11-09 21:19:44.718941484 +0200
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp	2026-11-09 17:11:57.000000000 +0200
+@@ -298,6 +298,7 @@
+     }
+ 
+     if (strstr(device_name, "810") ||
++        strstr(device_name, "825") ||
+         strstr(device_name, "830") ||
+         strstr(device_name, "840") ||
+         strstr(device_name, "850")) {

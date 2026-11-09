@@ -31,6 +31,11 @@
         android:theme="@style/AppTheme"
         android:hasCode="true">
 
+        <!-- The GPU backend (OpenCL) is the vendor's libOpenCL.so, which apps
+             may only load when they declare it (Android 12+). Optional: on
+             devices without it the engine runs on the CPU. -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+
         <!-- Main Activity -->
         <activity
             android:name=".MainActivity"

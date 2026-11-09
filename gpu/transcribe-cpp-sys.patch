@@ -1,0 +1,246 @@
+diff -ruN a/src/arch/whisper/bin_load.cpp b/src/arch/whisper/bin_load.cpp
+--- a/src/arch/whisper/bin_load.cpp	2026-11-09 21:19:46.044536039 +0200
++++ b/src/arch/whisper/bin_load.cpp	2026-11-09 17:31:59.000000000 +0200
+@@ -617,13 +617,10 @@
+     m->primary_backend = m->plan.primary;
+ 
+     // ---- Allocate backend buffer ----
+-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
+-    if (buf == nullptr) {
++    if (!allocate_weights(*m, kTag)) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: ggml_backend_alloc_ctx_tensors failed", kTag);
+         return TRANSCRIBE_ERR_OOM;
+     }
+-    m->backend_buffer = buf;
+-    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+ 
+     // ---- Stream tensor bytes from the .bin ----
+     if (auto st = transcribe::bin_loader::stream_tensor_data_from_bin(bm.path, stream_slots, "whisper");
+diff -ruN a/src/arch/whisper/decoder.cpp b/src/arch/whisper/decoder.cpp
+--- a/src/arch/whisper/decoder.cpp	2026-11-09 21:19:46.046191875 +0200
++++ b/src/arch/whisper/decoder.cpp	2026-11-08 22:00:47.000000000 +0200
+@@ -233,11 +233,13 @@
+         const size_t k_elem = ggml_element_size(kv_cache.self_k);
+         const size_t v_elem = ggml_element_size(kv_cache.self_v);
+ 
+-        ggml_tensor * k_dst = ggml_view_1d(ctx, kv_cache.self_k, static_cast<int64_t>(n_tokens) * d_model,
++        // 2D views matching Kcur/Vcur's shape, so the copy is a pure type
++        // conversion (backends such as Hexagon can't also reshape).
++        ggml_tensor * k_dst = ggml_view_2d(ctx, kv_cache.self_k, d_model, n_tokens, k_elem * d_model,
+                                            k_elem * static_cast<size_t>(static_cast<int64_t>(il) * n_ctx * d_model +
+                                                                         static_cast<int64_t>(n_past) * d_model));
+ 
+-        ggml_tensor * v_dst = ggml_view_1d(ctx, kv_cache.self_v, static_cast<int64_t>(n_tokens) * d_model,
++        ggml_tensor * v_dst = ggml_view_2d(ctx, kv_cache.self_v, d_model, n_tokens, v_elem * d_model,
+                                            v_elem * static_cast<size_t>(static_cast<int64_t>(il) * n_ctx * d_model +
+                                                                         static_cast<int64_t>(n_past) * d_model));
+ 
+@@ -604,11 +606,11 @@
+         const size_t v_elem = ggml_element_size(kv_cache.cross_v);
+ 
+         ggml_tensor * k_dst =
+-            ggml_view_1d(ctx, kv_cache.cross_k, static_cast<int64_t>(T_enc) * d_model,
++            ggml_view_2d(ctx, kv_cache.cross_k, d_model, T_enc, k_elem * d_model,
+                          k_elem * static_cast<size_t>(static_cast<int64_t>(il) * T_enc_pad * d_model));
+ 
+         ggml_tensor * v_dst =
+-            ggml_view_1d(ctx, kv_cache.cross_v, static_cast<int64_t>(T_enc) * d_model,
++            ggml_view_2d(ctx, kv_cache.cross_v, d_model, T_enc, v_elem * d_model,
+                          v_elem * static_cast<size_t>(static_cast<int64_t>(il) * T_enc_pad * d_model));
+ 
+         ggml_build_forward_expand(db.graph, ggml_cpy(ctx, Kcross, k_dst));
+diff -ruN a/src/arch/whisper/encoder.cpp b/src/arch/whisper/encoder.cpp
+--- a/src/arch/whisper/encoder.cpp	2026-11-09 21:19:46.046885209 +0200
++++ b/src/arch/whisper/encoder.cpp	2026-11-09 18:25:35.000000000 +0200
+@@ -20,6 +20,7 @@
+ // takes nullable bias slots and skips the add when null.
+ 
+ #include "encoder.h"
++#include "transcribe-env.h"
+ 
+ #include "conformer/conformer.h"
+ #include "ggml.h"
+@@ -98,10 +99,14 @@
+ 
+     ggml_tensor * o;
+     if (use_flash) {
+-        // flash_attn_ext wants q/k/v contiguous.
+-        ggml_tensor * q_c = ggml_cont(ctx, q);
+-        ggml_tensor * k_c = ggml_cont(ctx, k);
+-        ggml_tensor * v_c = ggml_cont(ctx, v);
++        // flash_attn_ext wants q/k/v contiguous. TRANSCRIBE_WHISPER_ENC_FA_F16
++        // makes K/V F16 instead (the copy converts): backends whose flash
++        // attention only takes F16 K/V (Hexagon) then run it themselves
++        // rather than handing each layer's attention to the CPU.
++        static const bool kv_f16 = transcribe::env::flag("TRANSCRIBE_WHISPER_ENC_FA_F16");
++        ggml_tensor *     q_c    = ggml_cont(ctx, q);
++        ggml_tensor *     k_c    = kv_f16 ? ggml_cast(ctx, k, GGML_TYPE_F16) : ggml_cont(ctx, k);
++        ggml_tensor *     v_c    = kv_f16 ? ggml_cast(ctx, v, GGML_TYPE_F16) : ggml_cont(ctx, v);
+         o                 = ggml_flash_attn_ext(ctx, q_c, k_c, v_c, nullptr, scale, 0.0f, 0.0f);
+         o                 = ggml_reshape_2d(ctx, o, d_model, T);
+     } else {
+diff -ruN a/src/arch/whisper/model.cpp b/src/arch/whisper/model.cpp
+--- a/src/arch/whisper/model.cpp	2026-11-09 21:19:46.045833916 +0200
++++ b/src/arch/whisper/model.cpp	2026-11-09 17:31:59.000000000 +0200
+@@ -61,6 +61,11 @@
+         safe_buffer_free(backend_buffer);
+         backend_buffer = nullptr;
+     }
++    if (decoder_buffer != nullptr) {
++        safe_buffer_free(decoder_buffer);
++        decoder_buffer = nullptr;
++    }
++    decoder_backend = nullptr;  // owned by plan.scheduler_list
+     for (auto it = plan.scheduler_list.rbegin(); it != plan.scheduler_list.rend(); ++it) {
+         safe_backend_free(*it);
+     }
+@@ -111,6 +116,50 @@
+     return true;
+ }
+ 
++ggml_backend_t decoder_backend_of(const WhisperModel & m) {
++    return m.decoder_backend != nullptr ? m.decoder_backend : m.plan.primary;
++}
++
++transcribe::BackendKind decoder_kind_of(const WhisperModel & m) {
++    return m.decoder_backend != nullptr ? transcribe::BackendKind::Cpu : m.plan.primary_kind;
++}
++
++bool allocate_weights(WhisperModel & m, const char * tag) {
++    ggml_backend_t cpu = m.plan.scheduler_list.empty() ? nullptr : m.plan.scheduler_list.back();
++    const bool     split =
++        transcribe::env::flag("TRANSCRIBE_WHISPER_CPU_DECODER") && cpu != nullptr && cpu != m.plan.primary &&
++        ggml_backend_dev_type(ggml_backend_get_device(cpu)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++        (m.plan.primary_kind == transcribe::BackendKind::Vulkan ||
++         m.plan.primary_kind == transcribe::BackendKind::OtherGpu);
++    if (!split) {
++        m.backend_buffer = ggml_backend_alloc_ctx_tensors(m.ctx_meta, m.plan.primary);
++        if (m.backend_buffer == nullptr) {
++            return false;
++        }
++        ggml_backend_buffer_set_usage(m.backend_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        return true;
++    }
++    // Encoder weights (and the mel frontend's) on the primary, decoder
++    // weights on the CPU.
++    std::vector<ggml_tensor *> enc, dec;
++    for (ggml_tensor * t = ggml_get_first_tensor(m.ctx_meta); t != nullptr; t = ggml_get_next_tensor(m.ctx_meta, t)) {
++        (std::strncmp(ggml_get_name(t), "dec.", 4) == 0 ? dec : enc).push_back(t);
++    }
++    m.backend_buffer = ggml_backend_buft_alloc_buffer_n(ggml_backend_get_default_buffer_type(m.plan.primary),
++                                                        enc.data(), static_cast<int>(enc.size()));
++    m.decoder_buffer = ggml_backend_buft_alloc_buffer_n(ggml_backend_get_default_buffer_type(cpu), dec.data(),
++                                                        static_cast<int>(dec.size()));
++    if (m.backend_buffer == nullptr || m.decoder_buffer == nullptr) {
++        return false;
++    }
++    ggml_backend_buffer_set_usage(m.backend_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    ggml_backend_buffer_set_usage(m.decoder_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    m.decoder_backend = cpu;
++    log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: encoder on %s, decoder on %s (%zu + %zu tensors)", tag,
++            ggml_backend_name(m.plan.primary), ggml_backend_name(cpu), enc.size(), dec.size());
++    return true;
++}
++
+ int kv_pad_self_attn(transcribe::BackendKind kind, bool use_flash) {
+     if (!use_flash) {
+         return 1;
+@@ -479,14 +528,11 @@
+     m->backend         = ggml_backend_name(m->plan.primary);
+     m->primary_backend = m->plan.primary;
+ 
+-    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
+-    if (weights_buffer == nullptr) {
++    if (!allocate_weights(*m, "whisper")) {
+         gguf_free(gguf_data);
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper: ggml_backend_alloc_ctx_tensors failed");
+         return TRANSCRIBE_ERR_OOM;
+     }
+-    m->backend_buffer = weights_buffer;
+-    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+ 
+     if (const transcribe_status st =
+             transcribe::load_common::stream_tensor_data(loader.path(), gguf_data, m->ctx_meta, "whisper");
+@@ -2008,7 +2054,7 @@
+                     !cm->weights.dec_blocks.empty() ? cm->weights.dec_blocks[0].self_q_w : nullptr;
+                 kv_type_g = (probe != nullptr && probe->type == GGML_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+             }
+-            if (!kv_cache_init(cc->kv_cache, cm->plan.primary, static_cast<int>(n_ctx_decoder), T_enc_local,
++            if (!kv_cache_init(cc->kv_cache, decoder_backend_of(*cm), static_cast<int>(n_ctx_decoder), T_enc_local,
+                                cm->hparams.dec_d_model, n_layers, kv_type_g)) {
+                 log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper run: KV cache init failed");
+                 return TRANSCRIBE_ERR_OOM;
+@@ -2083,7 +2129,7 @@
+                 if (!new_compute_ctx(16 * 1024 * 1024)) {
+                     return TRANSCRIBE_ERR_OOM;
+                 }
+-                const int    kv_pad = kv_pad_self_attn(cm->plan.primary_kind, cc->decoder_use_flash);
++                const int    kv_pad = kv_pad_self_attn(decoder_kind_of(*cm), cc->decoder_use_flash);
+                 DecoderBuild db     = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache,
+                                                              /*n_tokens=*/seq_len, /*n_past=*/0, T_enc_local,
+                                                              /*kv_pad=*/kv_pad,
+@@ -2251,7 +2297,8 @@
+             const bool primary_is_gpu = cm->plan.primary_kind != transcribe::BackendKind::Cpu &&
+                                         cm->plan.primary_kind != transcribe::BackendKind::Accel &&
+                                         cm->plan.primary_kind != transcribe::BackendKind::Unknown;
+-            const bool use_step_graph = primary_is_gpu && !transcribe::debug::enabled();
++            const bool use_step_graph =
++                primary_is_gpu && cm->decoder_backend == nullptr && !transcribe::debug::enabled();
+ 
+             // Sized to fit prompt + max generated tail, padded to next pow2,
+             // capped at n_ctx_decoder (448).
+@@ -2360,7 +2407,7 @@
+                     if (!new_compute_ctx(4 * 1024 * 1024)) {
+                         return TRANSCRIBE_ERR_OOM;
+                     }
+-                    const int    kv_pad = kv_pad_self_attn(cm->plan.primary_kind, cc->decoder_use_flash);
++                    const int    kv_pad = kv_pad_self_attn(decoder_kind_of(*cm), cc->decoder_use_flash);
+                     DecoderBuild step_db =
+                         build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache,
+                                                /*n_tokens=*/1, /*n_past=*/n_past, T_enc_local,
+@@ -2672,7 +2719,8 @@
+                                                      cm->plan.primary_kind != transcribe::BackendKind::Unknown;
+     const transcribe_timestamp_kind req_ts = params != nullptr ? params->timestamps : TRANSCRIBE_TIMESTAMPS_NONE;
+     const bool want_ts = req_ts == TRANSCRIBE_TIMESTAMPS_AUTO || req_ts == TRANSCRIBE_TIMESTAMPS_SEGMENT;
+-    if (n == 1 || !cc->decoder_use_flash || !primary_is_gpu || transcribe::debug::enabled() ||
++    if (n == 1 || !cc->decoder_use_flash || !primary_is_gpu || cm->decoder_backend != nullptr ||
++        transcribe::debug::enabled() ||
+         req_ts == TRANSCRIBE_TIMESTAMPS_WORD ||
+         (wp->prompt_condition == TRANSCRIBE_WHISPER_PROMPT_ALL_SEGMENTS && !wp->condition_on_prev_tokens)) {
+         return whisper_run_batch_serial(cc, pcm, n_samples, n, params);
+diff -ruN a/src/arch/whisper/whisper.h b/src/arch/whisper/whisper.h
+--- a/src/arch/whisper/whisper.h	2026-11-09 21:19:46.043541121 +0200
++++ b/src/arch/whisper/whisper.h	2026-11-09 17:31:59.000000000 +0200
+@@ -136,6 +136,16 @@
+ 
+ bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, int T_enc);
+ 
++struct WhisperModel;
++
++// Allocate the weight buffer(s) for m.ctx_meta: everything on the primary,
++// or the decoder on the CPU (see WhisperModel::decoder_backend).
++bool allocate_weights(WhisperModel & m, const char * tag);
++
++// Backend running the decoder and holding its KV cache, and its kind.
++ggml_backend_t          decoder_backend_of(const WhisperModel & m);
++transcribe::BackendKind decoder_kind_of(const WhisperModel & m);
++
+ // Active-KV padding for the self-attention step graph (whisper.cpp's
+ // whisper_kv_cache_get_padding): 32 on Metal+FA, 1 otherwise. Aligns the FA
+ // op's n_kv to a kernel-preferred multiple; trailing positions are masked to
+@@ -271,6 +281,15 @@
+     transcribe::BackendPlan plan;
+     ggml_backend_buffer_t   backend_buffer = nullptr;
+ 
++    // Decoder on the CPU while the encoder runs on a GPU primary
++    // (TRANSCRIBE_WHISPER_CPU_DECODER): the decoder's weights live in
++    // decoder_buffer (CPU) and its KV cache on decoder_backend, so the
++    // scheduler runs the token-by-token decoder on the CPU. Pays off where
++    // the GPU is fast at the encoder's large matmuls but slow per decode step
++    // (e.g. Adreno via OpenCL). Off: both nullptr.
++    ggml_backend_t        decoder_backend = nullptr;
++    ggml_backend_buffer_t decoder_buffer  = nullptr;
++
+     // Language token ids keyed by BCP-47 short code (from general.languages).
+     // Resolves a params.language string to the <|lang_xx|> token id (whisper
+     // packs these in tokenizer slots 50259 + lang_index).
