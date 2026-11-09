@@ -146,6 +146,10 @@ export KEY_PASS=yourpassword
 export STORE_PASS=yourpassword
 ```
 
+### GPU build (experimental)
+
+`gpu/build-gpu-apk.sh` builds a debug APK that runs the Whisper encoder on Adreno GPUs via OpenCL. See [gpu/README.md](gpu/README.md) for which phones it runs on and how to install the models.
+
 ### Model Assets
 
 The built-in Parakeet TDT GGUF model (~485 MB) is automatically downloaded from HuggingFace during the first `standard` build via a Gradle task. The checksum is verified with SHA-256. No manual download is needed. `fdroid` builds never download it.
