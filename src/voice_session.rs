@@ -1,11 +1,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use jni::objects::{GlobalRef, JObject};
 use jni::JNIEnv;
 
+use crate::early_runs::EarlyRuns;
 use crate::endpoint::Endpointer;
 use crate::engine;
 
@@ -28,6 +30,9 @@ pub struct VoiceSessionState {
     /// True while the current recording runs; flipped off on stop/cancel so
     /// the auto-stop monitor (if any) exits.
     pub session_active: Arc<AtomicBool>,
+    /// Transcribes the current recording's full runs while it goes on (see
+    /// [`crate::early_runs`]); returns them once the recording ends.
+    early_runs: Option<JoinHandle<EarlyRuns>>,
 }
 
 fn notify_status(env: &mut JNIEnv, obj: &JObject, msg: &str) {
@@ -72,6 +77,7 @@ pub fn init_session(env: JNIEnv, target: JObject) -> VoiceSessionState {
         target_ref: target_ref.clone(),
         last_level_sent: Arc::new(Mutex::new(std::time::Instant::now())),
         session_active: Arc::new(AtomicBool::new(false)),
+        early_runs: None,
     };
 
     // Load engine in background
@@ -109,7 +115,9 @@ pub fn start_recording(mut env: JNIEnv, state: &mut VoiceSessionState, auto_stop
         buffer_size: cpal::BufferSize::Default,
     };
 
-    state.audio_buffer.lock().unwrap().clear();
+    // A new buffer rather than clearing the old one: the previous
+    // recording's early-runs worker may still hold it.
+    state.audio_buffer = Arc::new(Mutex::new(Vec::new()));
     let buffer_clone = state.audio_buffer.clone();
 
     // End any previous session's monitor, then arm a fresh flag.
@@ -165,6 +173,10 @@ pub fn start_recording(mut env: JNIEnv, state: &mut VoiceSessionState, auto_stop
             s.play().ok();
             state.stream = Some(SendStream(s));
             notify_status(&mut env, state.target_ref.as_obj(), "Listening...");
+
+            let buffer = state.audio_buffer.clone();
+            let active = session_active.clone();
+            state.early_runs = Some(std::thread::spawn(move || run_early(buffer, active)));
 
             // Settings changed in the app since this process loaded the
             // model: reload while the user speaks rather than after.
@@ -240,6 +252,7 @@ pub fn stop_recording(mut env: JNIEnv, state: &mut VoiceSessionState) {
 
     let jvm = state.jvm.clone();
     let target_ref = state.target_ref.clone();
+    let early_runs = state.early_runs.take();
 
     notify_status(&mut env, target_ref.as_obj(), "Transcribing...");
 
@@ -259,7 +272,19 @@ pub fn stop_recording(mut env: JNIEnv, state: &mut VoiceSessionState) {
         }
 
         if let Some(eng_arc) = engine::get_engine() {
-            let res = engine::transcribe_speech(&eng_arc, buffer);
+            // Wait for a run still in flight, then transcribe what's left.
+            let early = early_runs.and_then(|worker| worker.join().ok());
+            let res = match early.as_ref().and_then(|early| early.rest(&buffer)) {
+                Some(rest) => {
+                    let rest_text = if rest.is_empty() {
+                        Ok(String::new())
+                    } else {
+                        engine::transcribe_shared(&eng_arc, buffer[rest].to_vec())
+                    };
+                    rest_text.map(|rest_text| early.expect("rest implies runs").text(&rest_text))
+                }
+                None => engine::transcribe_speech(&eng_arc, buffer),
+            };
 
             match res {
                 Ok(text) => {
@@ -277,6 +302,43 @@ pub fn stop_recording(mut env: JNIEnv, state: &mut VoiceSessionState) {
 pub fn cancel_recording(mut env: JNIEnv, state: &mut VoiceSessionState) {
     state.session_active.store(false, Ordering::SeqCst);
     state.stream = None;
+    // The early-runs worker finishes a run in flight and exits; its texts
+    // are dropped.
+    state.early_runs = None;
     state.audio_buffer.lock().unwrap().clear();
     notify_status(&mut env, state.target_ref.as_obj(), "Canceled");
+}
+
+/// How often the early-runs worker checks for a run it can transcribe.
+const EARLY_RUN_POLL: Duration = Duration::from_millis(500);
+
+/// Transcribes full runs of the recording in `buffer` while `active`, and
+/// returns them once it ends (after finishing a run in flight). Runs only
+/// with an up-to-date engine; until then the audio waits for the next check
+/// or for the end of the recording.
+fn run_early(buffer: Arc<Mutex<Vec<f32>>>, active: Arc<AtomicBool>) -> EarlyRuns {
+    let mut early = EarlyRuns::default();
+    while active.load(Ordering::SeqCst) {
+        std::thread::sleep(EARLY_RUN_POLL);
+        let next = {
+            let recorded = buffer.lock().unwrap();
+            early
+                .next_run(&recorded)
+                .map(|run| (run.clone(), recorded[run].to_vec()))
+        };
+        let Some((run, samples)) = next else { continue };
+        if !active.load(Ordering::SeqCst) || !engine::is_current() {
+            continue;
+        }
+        let Some(eng) = engine::get_engine() else { continue };
+        match engine::transcribe_shared(&eng, samples) {
+            Ok(text) => early.finished(run, text),
+            Err(e) => {
+                log::warn!("early run failed ({}); transcribing after the recording", e);
+                early.failed();
+                break;
+            }
+        }
+    }
+    early
 }

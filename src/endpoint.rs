@@ -44,6 +44,59 @@ const MIN_TRIM: usize = 2 * 16_000;
 /// stands out. Empty if the recording is digital silence only; the whole
 /// recording if no speech is found (very quiet speech is left to the model).
 pub fn speech_range(samples: &[f32]) -> std::ops::Range<usize> {
+    let (first, last) = match voiced_frames(samples) {
+        Voiced::DigitalSilence => return 0..0,
+        Voiced::NoSpeech => return 0..samples.len(),
+        Voiced::Speech { first, last } => (first, last),
+    };
+    let mut end = (last * FRAME + TRIM_MARGIN).min(samples.len());
+    if samples.len() - end < MIN_TRIM {
+        end = samples.len();
+    }
+    trimmed_start(first)..end
+}
+
+/// Where [`speech_range`] would start for a recording that begins with
+/// `samples`, or `None` if they contain no speech yet. Lets a recording be
+/// transcribed in runs while it is still going on; the noise floor is taken
+/// over `samples` only, so pass several seconds.
+pub fn speech_start(samples: &[f32]) -> Option<usize> {
+    match voiced_frames(samples) {
+        Voiced::Speech { first, .. } => Some(trimmed_start(first)),
+        _ => None,
+    }
+}
+
+/// End of the last speech in `samples` plus the margin [`speech_range`]
+/// keeps after it, or `None` if they contain no speech. A recording that
+/// begins with `samples` keeps at least this much when trimmed, however it
+/// continues (provided its noise floor stays about the same).
+pub fn speech_end(samples: &[f32]) -> Option<usize> {
+    match voiced_frames(samples) {
+        Voiced::Speech { last, .. } => Some((last * FRAME + TRIM_MARGIN).min(samples.len())),
+        _ => None,
+    }
+}
+
+/// Start of the audio to transcribe when speech starts at frame `first`.
+fn trimmed_start(first: usize) -> usize {
+    let start = (first * FRAME).saturating_sub(TRIM_MARGIN);
+    if start < MIN_TRIM {
+        0
+    } else {
+        start
+    }
+}
+
+enum Voiced {
+    DigitalSilence,
+    NoSpeech,
+    /// First and one past the last voiced frame.
+    Speech { first: usize, last: usize },
+}
+
+/// Voiced frames of `samples`, measured against their overall noise floor.
+fn voiced_frames(samples: &[f32]) -> Voiced {
     let mut prev: Option<f32> = None;
     let smoothed: Vec<Option<f32>> = samples
         .chunks(FRAME)
@@ -62,7 +115,7 @@ pub fn speech_range(samples: &[f32]) -> std::ops::Range<usize> {
 
     let mut live: Vec<f32> = smoothed.iter().flatten().copied().collect();
     if live.is_empty() {
-        return 0..0;
+        return Voiced::DigitalSilence;
     }
     live.sort_by(|a, b| a.total_cmp(b));
     let floor = live[((live.len() - 1) as f32 * FLOOR_PERCENTILE) as usize];
@@ -76,18 +129,10 @@ pub fn speech_range(samples: &[f32]) -> std::ops::Range<usize> {
             last = i + 1;
         }
     }
-    let Some(first) = first else {
-        return 0..samples.len();
-    };
-    let mut start = (first * FRAME).saturating_sub(TRIM_MARGIN);
-    let mut end = (last * FRAME + TRIM_MARGIN).min(samples.len());
-    if start < MIN_TRIM {
-        start = 0;
+    match first {
+        Some(first) => Voiced::Speech { first, last },
+        None => Voiced::NoSpeech,
     }
-    if samples.len() - end < MIN_TRIM {
-        end = samples.len();
-    }
-    start..end
 }
 
 pub struct Endpointer {
