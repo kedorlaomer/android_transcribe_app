@@ -248,13 +248,23 @@ impl Engine {
     }
 
     /// One run; with automatic routing, first identifies the run's language
-    /// and switches to its model.
+    /// and switches to its model. A decode loop at the end of the run's text
+    /// is cut off (see [`crate::repetition`]).
     fn route_and_run(&mut self, samples: &[f32]) -> Result<String, String> {
         if self.auto.is_some() {
             let lang = self.identify(samples);
             self.switch_to(&lang)?;
         }
-        self.run(samples)
+        let text = self.run(samples)?;
+        let trimmed = crate::repetition::trim_loop(&text);
+        if trimmed.len() != text.len() {
+            log::warn!(
+                "dropped a repeating tail: {} of {} words kept",
+                trimmed.split_whitespace().count(),
+                text.split_whitespace().count()
+            );
+        }
+        Ok(trimmed)
     }
 
     /// The run's language among [`LANGUAGE_MODELS`], or the previous run's
