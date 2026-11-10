@@ -6,6 +6,8 @@ pub mod engine;
 pub mod ime;
 pub mod main_activity;
 pub mod models;
+#[cfg(feature = "qnn")]
+pub mod qnn;
 pub mod recog_service;
 pub mod recognize;
 pub mod repetition;

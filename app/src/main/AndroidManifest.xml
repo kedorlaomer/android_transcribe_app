@@ -35,6 +35,10 @@
              may only load when they declare it (Android 12+). Optional: on
              devices without it the engine runs on the CPU. -->
         <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <!-- The NPU backend (npu-qnn build) reaches the Hexagon NPU through the
+             vendor's FastRPC driver, which apps must declare the same way.
+             Optional: without it NPU models fail to load with an error. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
 
         <!-- Main Activity -->
         <activity

@@ -31,6 +31,18 @@ pub fn files_dir(env: &mut JNIEnv, context: &JObject) -> anyhow::Result<PathBuf>
     Ok(PathBuf::from(path_string))
 }
 
+/// The directory the APK's native libraries are extracted to
+/// (`ApplicationInfo.nativeLibraryDir`).
+#[cfg(feature = "qnn")]
+pub fn native_library_dir(env: &mut JNIEnv, context: &JObject) -> anyhow::Result<PathBuf> {
+    let info = env
+        .call_method(context, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", &[])?
+        .l()?;
+    let dir = env.get_field(&info, "nativeLibraryDir", "Ljava/lang/String;")?.l()?;
+    let dir: String = env.get_string(&dir.into())?.into();
+    Ok(PathBuf::from(dir))
+}
+
 /// Resolves the app's shared-storage media directory
 /// (`Android/media/<package>/`), where the per-language models are placed.
 pub fn media_dir(env: &mut JNIEnv, context: &JObject) -> anyhow::Result<PathBuf> {

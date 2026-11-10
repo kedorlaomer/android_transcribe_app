@@ -56,6 +56,42 @@ const LANGID_MIN_P: f32 = 0.5;
 /// Language assumed until a run has been identified confidently.
 const LANGID_DEFAULT: &str = "en";
 
+/// NPU builds (`--features qnn`): per-language model directories that take
+/// the place of [`LANGUAGE_MODELS`]' files when present (see npu/README.md).
+/// Each holds a large-v3-turbo encoder/decoder pair precompiled for the
+/// Hexagon NPU; English and German share the stock model like above.
+#[cfg(feature = "qnn")]
+const QNN_LANGUAGE_MODELS: &[(&str, &str)] = &[
+    ("en", "qnn-en"),
+    ("de", "qnn-en"),
+    ("sk", "qnn-sk"),
+    ("he", "qnn-he"),
+];
+
+/// Directory in the models folder with what the NPU models share: the
+/// tokenizer's vocabulary and the mel filter bank.
+#[cfg(feature = "qnn")]
+const QNN_SHARED_DIR: &str = "qnn-shared";
+
+/// The language-model file for a language tag (`de-DE` matches `de`), if any.
+/// In NPU builds, a language whose NPU model directory is present in
+/// `models_dir` gets that directory instead.
+fn language_model_path(models_dir: &Path, language: Option<&str>) -> Option<PathBuf> {
+    #[cfg(feature = "qnn")]
+    {
+        let primary = language?.split('-').next()?.to_ascii_lowercase();
+        let qnn = QNN_LANGUAGE_MODELS
+            .iter()
+            .find(|(lang, _)| *lang == primary)
+            .map(|(_, dir)| models_dir.join(dir))
+            .filter(|dir| crate::qnn::QnnWhisper::is_model_dir(dir));
+        if qnn.is_some() {
+            return qnn;
+        }
+    }
+    language_model_file(language).map(|file| models_dir.join(file))
+}
+
 /// The language-model file for a language tag (`de-DE` matches `de`), if any.
 fn language_model_file(language: Option<&str>) -> Option<&'static str> {
     let primary = language?.split('-').next()?.to_ascii_lowercase();
@@ -101,15 +137,34 @@ struct AutoLanguage {
     models_dir: PathBuf,
     /// The most recently used model other than the current one, kept loaded
     /// so alternating between two languages doesn't reload each time.
-    spare: Option<(PathBuf, transcribe_cpp::Session)>,
+    spare: Option<(PathBuf, Backend)>,
     threads: i32,
     /// Language of the last run, used when identification is unsure.
     last: String,
 }
 
-/// A loaded transcribe.cpp session plus the options applied to every run.
+/// What runs a model: transcribe.cpp (CPU/GPU), or in NPU builds the
+/// Qualcomm NPU.
+enum Backend {
+    Transcribe(transcribe_cpp::Session),
+    #[cfg(feature = "qnn")]
+    Npu(crate::qnn::QnnWhisper),
+}
+
+/// Loads a model for [`Backend`]: an NPU model directory on the NPU, anything
+/// else through transcribe.cpp.
+fn open_backend(path: &Path, threads: i32) -> Result<Backend, String> {
+    #[cfg(feature = "qnn")]
+    if crate::qnn::QnnWhisper::is_model_dir(path) {
+        let shared = path.parent().unwrap_or(path).join(QNN_SHARED_DIR);
+        return crate::qnn::QnnWhisper::load(path, &shared).map(Backend::Npu);
+    }
+    open_session(&load_model(path)?, threads).map(Backend::Transcribe)
+}
+
+/// A loaded model plus the options applied to every run.
 pub struct Engine {
-    session: transcribe_cpp::Session,
+    session: Backend,
     session_path: PathBuf,
     language: Option<String>,
     auto: Option<AutoLanguage>,
@@ -129,6 +184,10 @@ impl Engine {
         translate: bool,
         threads: i32,
     ) -> Result<Engine, String> {
+        #[cfg(feature = "qnn")]
+        if crate::qnn::QnnWhisper::is_model_dir(model_path) {
+            return Engine::load_npu(model_path, language, translate);
+        }
         let model = load_model(model_path)?;
         // Translation is gated on the model's capabilities: models without it
         // (e.g. Parakeet) silently keep transcribing, so the setting can stay
@@ -186,7 +245,7 @@ impl Engine {
             task,
             run_ext.is_some()
         );
-        let session = open_session(&model, threads)?;
+        let session = Backend::Transcribe(open_session(&model, threads)?);
         Ok(Engine {
             session,
             session_path: model_path.to_path_buf(),
@@ -195,6 +254,28 @@ impl Engine {
             task,
             run_ext,
             ready_status,
+        })
+    }
+
+    /// Loads an NPU model directory. Whisper Turbo can't translate (see
+    /// above), so the translate setting only changes the status.
+    #[cfg(feature = "qnn")]
+    fn load_npu(dir: &Path, language: Option<String>, translate: bool) -> Result<Engine, String> {
+        let started = std::time::Instant::now();
+        let session = open_backend(dir, 0)?;
+        log::info!("engine: {} on the NPU, loaded in {:.2}s", dir.display(), started.elapsed().as_secs_f64());
+        Ok(Engine {
+            session,
+            session_path: dir.to_path_buf(),
+            language,
+            auto: None,
+            task: transcribe_cpp::Task::Transcribe,
+            run_ext: None,
+            ready_status: if translate {
+                "Ready (note: Whisper Turbo translates poorly; use another Whisper)"
+            } else {
+                "Ready"
+            },
         })
     }
 
@@ -207,9 +288,9 @@ impl Engine {
         let langid = langid_model
             .langid_session_with(&transcribe_cpp::LangIdSessionOptions { n_threads: threads })
             .map_err(|e| e.to_string())?;
-        let first = language_model_file(Some(LANGID_DEFAULT)).expect("default language has a model");
+        let first = language_model_path(models_dir, Some(LANGID_DEFAULT)).expect("default language has a model");
         let mut engine = Engine::load(
-            &models_dir.join(first),
+            &first,
             Some(LANGID_DEFAULT.to_string()),
             translate,
             threads,
@@ -299,8 +380,8 @@ impl Engine {
     fn switch_to(&mut self, lang: &str) -> Result<(), String> {
         self.language = Some(lang.to_string());
         let auto = self.auto.as_mut().expect("automatic routing");
-        let file = language_model_file(Some(lang)).ok_or_else(|| format!("no model for {}", lang))?;
-        let path = auto.models_dir.join(file);
+        let path = language_model_path(&auto.models_dir, Some(lang)).ok_or_else(|| format!("no model for {}", lang))?;
+        let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         if path == self.session_path {
             return Ok(());
         }
@@ -310,7 +391,7 @@ impl Engine {
                 // Free the old spare first: it is the least recently used.
                 drop(other);
                 let started = std::time::Instant::now();
-                let session = open_session(&load_model(&path)?, auto.threads)?;
+                let session = open_backend(&path, auto.threads)?;
                 log::info!("loaded {} in {:.2}s", file, started.elapsed().as_secs_f64());
                 (path, session)
             }
@@ -327,6 +408,15 @@ impl Engine {
     /// locales/short codes, English-only models take none). The degraded
     /// value is kept so later runs skip the rejected attempts.
     fn run(&mut self, samples: &[f32]) -> Result<String, String> {
+        let session = match &mut self.session {
+            Backend::Transcribe(session) => session,
+            #[cfg(feature = "qnn")]
+            Backend::Npu(npu) => {
+                // The NPU models are Whisper; their decoder prompt needs a
+                // language, so without a hint it detects one per run.
+                return npu.transcribe(samples, self.language.as_deref(), false);
+            }
+        };
         loop {
             let opts = transcribe_cpp::RunOptions {
                 language: self.language.clone(),
@@ -334,7 +424,7 @@ impl Engine {
                 family: self.run_ext.clone(),
                 ..Default::default()
             };
-            match self.session.run(samples, &opts) {
+            match session.run(samples, &opts) {
                 Ok(t) => return Ok(t.text),
                 // Some model families stop a decode that hit its length
                 // budget or started repeating itself; the text up to that
@@ -446,8 +536,7 @@ impl EngineConfig {
         let models_dir = media_dir.map(|dir| dir.join("models"));
         let language_model = models_dir
             .as_ref()
-            .zip(language_model_file(language.as_deref()))
-            .map(|(dir, file)| dir.join(file));
+            .and_then(|dir| language_model_path(dir, language.as_deref()));
         let auto_models_dir = models_dir
             .filter(|dir| language.is_none() && dir.join(LANGID_MODEL).is_file());
         let active_model = read_config(&files_dir.join(ACTIVE_MODEL_FILE));
@@ -456,6 +545,8 @@ impl EngineConfig {
             .or_else(|| auto_models_dir.as_ref().map(|dir| dir.join(LANGID_MODEL)))
             .or_else(|| active_model.as_ref().map(|name| files_dir.join("models").join(name)));
         let model_stamp = model_path.and_then(|path| {
+            // An NPU model is a directory; its encoder stands in for it.
+            let path = if path.is_dir() { path.join("encoder.bin") } else { path };
             let meta = std::fs::metadata(path).ok()?;
             Some((meta.len(), meta.modified().ok()))
         });
@@ -845,6 +936,11 @@ fn do_load(env: &mut JNIEnv, context: &JObject) -> Result<(), String> {
         .map_err(|e| log::warn!("no media dir: {}", e))
         .ok();
     configure_gpu_env(&files_dir);
+    #[cfg(feature = "qnn")]
+    match assets::native_library_dir(env, context) {
+        Ok(dir) => crate::qnn::configure_env(&dir),
+        Err(e) => log::warn!("no native library dir, the NPU won't load: {}", e),
+    }
     let dirs = ConfigDirs {
         files_dir: files_dir.clone(),
         media_dir,

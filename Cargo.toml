@@ -16,3 +16,12 @@ jni = "0.21"
 libc = "0.2"
 once_cell = "1.19"
 crossbeam-channel = "0.5"
+
+[features]
+# NPU build (npu/build-npu-apk.sh): Whisper on the Qualcomm Hexagon NPU through
+# ONNX Runtime's QNN execution provider. Needs QNN_ORT_DIR at build time.
+qnn = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1.2", optional = true }
+

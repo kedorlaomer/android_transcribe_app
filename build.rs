@@ -15,4 +15,23 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", out.display());
         println!("cargo:rustc-link-lib=dylib=c++_shared");
     }
+
+    // NPU build: the C++ wrapper around ONNX Runtime (qnn/qnn_whisper.cpp),
+    // compiled against the onnxruntime-android-qnn AAR unpacked in
+    // QNN_ORT_DIR (headers/ and jni/arm64-v8a/libonnxruntime.so).
+    #[cfg(feature = "qnn")]
+    {
+        let ort = PathBuf::from(env::var("QNN_ORT_DIR").expect("QNN_ORT_DIR: the unpacked onnxruntime-android-qnn AAR"));
+        println!("cargo:rerun-if-changed=qnn/qnn_whisper.cpp");
+        println!("cargo:rerun-if-env-changed=QNN_ORT_DIR");
+        cc::Build::new()
+            .cpp(true)
+            .std("c++17")
+            .file("qnn/qnn_whisper.cpp")
+            .include(ort.join("headers"))
+            .cpp_link_stdlib(None)
+            .compile("qnn_whisper");
+        println!("cargo:rustc-link-search=native={}", ort.join("jni/arm64-v8a").display());
+        println!("cargo:rustc-link-lib=dylib=onnxruntime");
+    }
 }

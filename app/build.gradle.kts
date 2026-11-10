@@ -79,7 +79,11 @@ android {
 
     packaging {
         jniLibs {
-            useLegacyPackaging = false          // extractNativeLibs=false (16KB safe)
+            // extractNativeLibs=false (16KB safe). The NPU build
+            // (npu/build-npu-apk.sh, -PnpuBuild=true) extracts them: the NPU
+            // loads its half of the QNN backend (libQnnHtpV73Skel.so) as a
+            // file from a directory, which a library kept inside the APK isn't.
+            useLegacyPackaging = project.findProperty("npuBuild") == "true"
             // Already stripped of debug info by cargoNdkBuild; AGP's stripping
             // would also remove the function names native crash traces show.
             keepDebugSymbols += "**/*.so"
