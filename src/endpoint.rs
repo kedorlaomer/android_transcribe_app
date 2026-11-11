@@ -30,6 +30,13 @@ const MIN_VOICED_RUN: u32 = 3;
 /// real background, so they are skipped.
 const DIGITAL_SILENCE_DB: f32 = -90.0;
 
+/// When trimming, the absolute level a voiced frame must exceed instead of
+/// [`MIN_SPEECH_DB`]. Some microphones record normal speech at -45 to -60 dB
+/// over a -73 dB background, so -55 dB cut quieter last words (and once
+/// 30 s of speech before a louder stretch) as silence; the relative
+/// threshold over the recording's noise floor does the work instead.
+const TRIM_MIN_SPEECH_DB: f32 = -70.0;
+
 /// Audio kept before the first and after the last speech when trimming.
 const TRIM_MARGIN: usize = 16_000;
 /// Quiet stretches shorter than this are left alone.
@@ -122,7 +129,7 @@ fn voiced_frames(samples: &[f32]) -> Voiced {
 
     let (mut first, mut last, mut run) = (None, 0, 0);
     for (i, s) in smoothed.iter().enumerate() {
-        let voiced = s.is_some_and(|s| s > floor + SPEECH_DB && s > MIN_SPEECH_DB);
+        let voiced = s.is_some_and(|s| s > floor + SPEECH_DB && s > TRIM_MIN_SPEECH_DB);
         run = if voiced { run + 1 } else { 0 };
         if run >= MIN_VOICED_RUN as usize {
             first.get_or_insert(i + 1 - run);
